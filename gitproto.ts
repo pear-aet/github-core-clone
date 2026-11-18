@@ -264,17 +264,15 @@ function handleV2Fetch(repo: Repo, req: FetchRequest): Buffer {
 }
 
 function writePackFor(repo: Repo, oids: Set<string>): Buffer {
+  // Deterministic pack order: sort the OIDs (already known strings) so
+  // replays are byte-identical. Never recompute objectId here: the sort
+  // comparator used to SHA-1 every object per comparison (O(n log n) hashes).
+  const sortedOids = [...oids].sort();
   const objects: { type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }[] = [];
-  for (const oid of oids) {
+  for (const oid of sortedOids) {
     const obj = repo.objects.get(oid);
     if (obj) objects.push(obj);
   }
-  // Deterministic pack order: sort by oid so replays are byte-identical.
-  objects.sort((a, b) => {
-    const oa = objectId(a.type, a.data);
-    const ob = objectId(b.type, b.data);
-    return oa < ob ? -1 : oa > ob ? 1 : 0;
-  });
   return writePack(objects);
 }
 
