@@ -191,6 +191,7 @@ export function readPack(pack: Buffer): PackObject[] {
   if (trailer !== actual) throw new Error('pack trailer checksum mismatch');
   const objects: PackObject[] = [];
   const byOffset = new Map<number, PackObject>();
+  const byOid = new Map<string, PackObject>();
   let offset = 12;
   for (let i = 0; i < count; i += 1) {
     const startOffset = offset;
@@ -211,12 +212,13 @@ export function readPack(pack: Buffer): PackObject[] {
       const consumed = zlibConsumed(pack, offset);
       const delta = inflateSync(pack.subarray(offset, offset + consumed));
       offset += consumed;
-      const base = baseOid !== null ? objects.find((o) => o.oid === baseOid) : byOffset.get(baseOffset);
+      const base = baseOid !== null ? byOid.get(baseOid) : byOffset.get(baseOffset);
       if (!base) throw new Error('delta base not found in pack');
       const data = applyDelta(base.data, delta);
       const obj: PackObject = { oid: objectId(base.type, data), type: base.type, data };
       objects.push(obj);
       byOffset.set(startOffset, obj);
+      byOid.set(obj.oid, obj);
       void size;
     } else {
       const typeName = TYPE_NAMES[type];
@@ -228,6 +230,7 @@ export function readPack(pack: Buffer): PackObject[] {
       const obj: PackObject = { oid: objectId(typeName, data), type: typeName, data };
       objects.push(obj);
       byOffset.set(startOffset, obj);
+      byOid.set(obj.oid, obj);
     }
   }
   return objects;
