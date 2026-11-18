@@ -293,8 +293,11 @@ export function collectClosure(
       }
     }
   };
-  while (queue.length) {
-    const { oid, gen } = queue.shift()!;
+  // Index pointer instead of queue.shift(): shift() re-indexes the whole
+  // array on every dequeue (O(n) each, O(n^2) total for a big closure).
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, gen } = queue[head++]!;
     const obj = repo.objects.get(oid);
     if (!obj) continue;
     if (obj.type === 'tag') {
@@ -351,8 +354,9 @@ export function mergeBase(repo: Repo, a: string, b: string): string | null {
   const ancestorsA = new Map<string, number>();
   const queue: { oid: string; gen: number }[] = [{ oid: a, gen: 0 }];
   const seen = new Set<string>();
-  while (queue.length) {
-    const { oid, gen } = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, gen } = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     ancestorsA.set(oid, gen);
@@ -364,8 +368,9 @@ export function mergeBase(repo: Repo, a: string, b: string): string | null {
   let bestGen = Infinity;
   const queueB: { oid: string; gen: number }[] = [{ oid: b, gen: 0 }];
   const seenB = new Set<string>();
-  while (queueB.length) {
-    const { oid, gen } = queueB.shift()!;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const { oid, gen } = queueB[headB++]!;
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (ancestorsA.has(oid)) {
