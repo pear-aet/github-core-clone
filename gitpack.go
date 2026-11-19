@@ -11,6 +11,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 type PktKind int
@@ -247,11 +248,7 @@ func readPack(pack []byte) ([]PackObject, error) {
 				off = after
 				baseOff = startOff - v
 			}
-			consumed, err := zlibConsumed(pack, off)
-			if err != nil {
-				return nil, err
-			}
-			delta, err := inflate(pack[off : off+consumed])
+			delta, consumed, err := inflateFrom(pack, off)
 			if err != nil {
 				return nil, err
 			}
@@ -279,11 +276,7 @@ func readPack(pack []byte) ([]PackObject, error) {
 			if !ok {
 				return nil, fmt.Errorf("unknown pack object type %d", typ)
 			}
-			consumed, err := zlibConsumed(pack, off)
-			if err != nil {
-				return nil, err
-			}
-			data, err := inflate(pack[off : off+consumed])
+			data, consumed, err := inflateFrom(pack, off)
 			if err != nil {
 				return nil, err
 			}
@@ -300,6 +293,23 @@ func readPack(pack []byte) ([]PackObject, error) {
 	return objects, nil
 }
 
+func inflateFrom(buf []byte, off int) ([]byte, int, error) {
+	br := bytes.NewReader(buf[off:])
+	zr, err := zlib.NewReader(br)
+	if err != nil {
+		return nil, 0, err
+	}
+	data, err := io.ReadAll(zr)
+	zr.Close()
+	if err != nil {
+		return nil, 0, err
+	}
+	// The zlib reader never over-reads: the bytes.Reader position is exactly
+	// the end of this stream, so one inflate gives both data and length.
+	consumed := len(buf) - off - br.Len()
+	return data, consumed, nil
+}
+
 func inflate(b []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(b))
 	if err != nil {
@@ -309,27 +319,16 @@ func inflate(b []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+var zlibWriterPool = sync.Pool{New: func() interface{} { return zlib.NewWriter(io.Discard) }}
+
 func deflate(b []byte) []byte {
 	var buf bytes.Buffer
-	w := zlib.NewWriter(&buf)
+	w := zlibWriterPool.Get().(*zlib.Writer)
+	w.Reset(&buf)
 	w.Write(b)
 	w.Close()
+	zlibWriterPool.Put(w)
 	return buf.Bytes()
-}
-
-// zlibConsumed finds the length of the zlib stream at off.
-func zlibConsumed(buf []byte, off int) (int, error) {
-	r := bytes.NewReader(buf[off:])
-	zr, err := zlib.NewReader(r)
-	if err != nil {
-		return 0, err
-	}
-	defer zr.Close()
-	if _, err := io.Copy(io.Discard, zr); err != nil {
-		return 0, err
-	}
-	consumed := len(buf) - off - r.Len()
-	return consumed, nil
 }
 
 func writePack(objects []PackObject) []byte {

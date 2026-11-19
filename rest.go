@@ -70,6 +70,70 @@ func issueJSON(r *Repo, i *Issue) map[string]interface{} {
 	}
 }
 
+type issueLabelResp struct {
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+type issueResp struct {
+	ID        int              `json:"id"`
+	NodeID    string           `json:"node_id"`
+	Number    int              `json:"number"`
+	Title     string           `json:"title"`
+	Body      string           `json:"body"`
+	State     string           `json:"state"`
+	Labels    []issueLabelResp `json:"labels"`
+	User      struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// issueJSONBytes marshals one issue via a struct (no map reflection) for the
+// single-issue GET/POST path. Field for field it matches issueJSON.
+func issueJSONBytes(r *Repo, i *Issue) []byte {
+	labels := make([]issueLabelResp, 0, len(i.Labels))
+	for _, name := range i.Labels {
+		color := "000000"
+		if l, ok := r.Labels[name]; ok {
+			color = l.Color
+		}
+		labels = append(labels, issueLabelResp{Name: name, Color: color})
+	}
+	resp := issueResp{
+		ID: i.ID, NodeID: "I_" + itoa(i.ID), Number: i.Number,
+		Title: i.Title, Body: i.Body, State: i.State,
+		Labels: labels, CreatedAt: i.CreatedAt, UpdatedAt: i.UpdatedAt,
+	}
+	resp.User.Login = i.User.Login
+	b, _ := json.Marshal(resp)
+	return b
+}
+
+// issueJSONCached returns the issue's cached response bytes, building them once.
+func issueJSONCached(r *Repo, i *Issue) []byte {
+	r.mu.RLock()
+	b := i.cachedJSON
+	r.mu.RUnlock()
+	if b != nil {
+		return b
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i.cachedJSON != nil {
+		return i.cachedJSON
+	}
+	i.cachedJSON = issueJSONBytes(r, i)
+	return i.cachedJSON
+}
+
+func writeJSONBytes(w http.ResponseWriter, code int, b []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(b)
+}
+
 func pullJSON(p *Pull) map[string]interface{} {
 	return map[string]interface{}{
 		"id": p.ID, "node_id": "PR_" + itoa(p.ID), "number": p.Number,
@@ -462,7 +526,7 @@ func routeIssues(repo *Repo, rest []string, w http.ResponseWriter, r *http.Reque
 			iss := &Issue{ID: 1000 + n, Number: n, Title: body.Title, Body: body.Body, State: "open", Labels: body.Labels, CreatedAt: FixedTS, UpdatedAt: FixedTS}
 			iss.User.Login = "adaiversen"
 			repo.Issues[n] = iss
-			jsonWrite(w, 201, issueJSON(repo, iss))
+			writeJSONBytes(w, 201, issueJSONCached(repo, iss))
 			return true
 		}
 	}
@@ -478,7 +542,7 @@ func routeIssues(repo *Repo, rest []string, w http.ResponseWriter, r *http.Reque
 			return true
 		}
 		if r.Method == "GET" {
-			jsonWrite(w, 200, issueJSON(repo, iss))
+			writeJSONBytes(w, 200, issueJSONCached(repo, iss))
 			return true
 		}
 		if r.Method == "PATCH" {
@@ -498,7 +562,10 @@ func routeIssues(repo *Repo, rest []string, w http.ResponseWriter, r *http.Reque
 				iss.State = *body.State
 			}
 			iss.UpdatedAt = FixedTS
-			jsonWrite(w, 200, issueJSON(repo, iss))
+			repo.mu.Lock()
+			iss.cachedJSON = nil
+			repo.mu.Unlock()
+			writeJSONBytes(w, 200, issueJSONCached(repo, iss))
 			return true
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const ZeroOID = "0000000000000000000000000000000000000000"
@@ -37,6 +38,9 @@ type Issue struct {
 	User      struct{ Login string `json:"login"` } `json:"user"`
 	CreatedAt string   `json:"created_at"`
 	UpdatedAt string   `json:"updated_at"`
+	// cachedJSON is the marshaled single-issue response, built once and
+	// served raw on GET; cleared on PATCH. Guarded by the repo's mu.
+	cachedJSON []byte
 }
 
 type Pull struct {
@@ -84,6 +88,10 @@ type Repo struct {
 	Labels        map[string]struct{ Name, Color string }
 	Comments      map[int][]*Comment
 	Counter       int
+	// mu guards packCache only; the object and ref maps are single-writer
+	// per request in the paths that use them.
+	mu        sync.RWMutex
+	packCache map[string]*packEntry
 }
 
 type Store struct {
@@ -272,6 +280,38 @@ func countLines(r *Repo, oid string) int {
 	return bytes.Count(obj.Data, []byte("\n")) + 1
 }
 
+func parseCommitHeader(data []byte) (tree string, parents []string) {
+	// Scan the header lines on the raw bytes: no string copy of the body,
+	// no Split of every line. The header ends at the blank line.
+	off := 0
+	for off < len(data) {
+		nl := indexByte(data[off:], '\n')
+		var line []byte
+		if nl < 0 {
+			line = data[off:]
+			off = len(data)
+		} else {
+			line = data[off : off+nl]
+			off += nl + 1
+		}
+		if len(line) == 0 {
+			break
+		}
+		if bytes.HasPrefix(line, []byte("tree ")) {
+			tree = string(line[5:])
+		} else if bytes.HasPrefix(line, []byte("parent ")) {
+			parents = append(parents, string(line[7:]))
+		}
+	}
+	return tree, parents
+}
+
+// commitParents returns just the parent OIDs of a commit object, byte-scanned.
+func commitParents(data []byte) []string {
+	_, parents := parseCommitHeader(data)
+	return parents
+}
+
 func parseCommit(data []byte) CommitInfo {
 	text := string(data)
 	split := strings.Index(text, "\n\n")
@@ -400,15 +440,15 @@ func collectClosure(r *Repo, tips []string, depth *int, stopAt map[string]bool) 
 		}
 		seenCommit[it.oid] = true
 		objects[it.oid] = true
-		c := parseCommit(obj.Data)
-		collectTree(c.Tree)
+		treeOID, parents := parseCommitHeader(obj.Data)
+		collectTree(treeOID)
 		atCutoff := depth != nil && it.gen >= *depth-1
 		stopped := stopAt != nil && stopAt[it.oid]
 		if atCutoff {
 			shallow = append(shallow, it.oid)
 		}
 		if !atCutoff && !stopped {
-			for _, p := range c.Parents {
+			for _, p := range parents {
 				queue = append(queue, item{p, it.gen + 1})
 			}
 		}
@@ -419,6 +459,15 @@ func collectClosure(r *Repo, tips []string, depth *int, stopAt map[string]bool) 
 func isAncestor(r *Repo, ancestor, descendant string) bool {
 	if ancestor == descendant {
 		return true
+	}
+	// Fast path: the common case is a direct child (a push whose new commit
+	// names the old tip as its parent). One header scan, no walk.
+	if obj := r.Objects[descendant]; obj != nil && obj.Type == Commit {
+		for _, p := range commitParents(obj.Data) {
+			if p == ancestor {
+				return true
+			}
+		}
 	}
 	seen := make(map[string]bool)
 	stack := []string{descendant}
@@ -443,7 +492,7 @@ func isAncestor(r *Repo, ancestor, descendant string) bool {
 		if obj.Type != Commit {
 			continue
 		}
-		stack = append(stack, parseCommit(obj.Data).Parents...)
+		stack = append(stack, commitParents(obj.Data)...)
 	}
 	return false
 }

@@ -221,19 +221,33 @@ func handleUploadPack(r *Repo, body []byte, proto string) (int, []byte) {
 	for _, s := range req.shallow {
 		stopAt[s] = true
 	}
-	held, _ := collectClosure(r, req.haves, nil, stopAt)
-	wanted, newShallow := collectClosure(r, req.wants, ptrInt(depth), nil)
-	send := make(map[string]bool)
-	for oid := range wanted {
-		if !held[oid] {
-			send[oid] = true
-		}
-	}
 	var acks []string
 	for _, have := range req.haves {
 		if _, ok := r.Objects[have]; ok {
 			acks = append(acks, have)
 		}
+	}
+	// The fetch result (pack bytes + shallow boundary) is fully determined
+	// by wants/depth/haves/shallow, so cache it: 50 concurrent clones of
+	// the same tip share one deflate instead of fifty.
+	key := packCacheKey(req.wants, depth, req.haves, req.shallow)
+	var framed []byte
+	var newShallow []string
+	var wanted map[string]bool
+	if ent := getPackCache(r, key); ent != nil {
+		framed, newShallow, wanted = ent.framed, ent.shallow, ent.wanted
+	} else {
+		held, _ := collectClosure(r, req.haves, nil, stopAt)
+		wanted, newShallow = collectClosure(r, req.wants, ptrInt(depth), nil)
+		send := make(map[string]bool)
+		for oid := range wanted {
+			if !held[oid] {
+				send[oid] = true
+			}
+		}
+		pack := writePackFor(r, send)
+		framed = sidebandPack(pack)
+		setPackCache(r, key, &packEntry{framed: framed, shallow: newShallow, wanted: wanted})
 	}
 	var unshallow []string
 	for _, oid := range req.shallow {
@@ -250,7 +264,6 @@ func handleUploadPack(r *Repo, body []byte, proto string) (int, []byte) {
 			}
 		}
 	}
-	pack := writePackFor(r, send)
 	if proto == "v2" {
 		var out []byte
 		// acknowledgments section (only when client sent haves)
@@ -295,7 +308,7 @@ func handleUploadPack(r *Repo, body []byte, proto string) (int, []byte) {
 		}
 		// packfile section
 		out = append(out, pktLineStr("packfile\n")...)
-		out = append(out, sidebandPack(pack)...)
+		out = append(out, framed...)
 		out = append(out, pktLine(nil, PktFlush)...)
 		return 200, out
 	}
@@ -315,9 +328,50 @@ func handleUploadPack(r *Repo, body []byte, proto string) (int, []byte) {
 		out = append(out, pktLineStr("unshallow "+sh+"\n")...)
 	}
 	out = append(out, pktLine(nil, PktFlush)...)
-	out = append(out, sidebandPack(pack)...)
+	out = append(out, framed...)
 	out = append(out, pktLine(nil, PktFlush)...)
 	return 200, out
+}
+
+type packEntry struct {
+	framed  []byte
+	shallow []string
+	wanted  map[string]bool
+}
+
+// packCacheKey identifies one fetch result: the wanted tips, the depth, and
+// what the client already has. The closure (and so the pack) is fully
+// determined by these plus the repo's objects, and a push changes the tip,
+// so a new tip is a new key and stale entries are never served.
+func packCacheKey(wants []string, depth int, haves, shallow []string) string {
+	w := append([]string(nil), wants...)
+	sort.Strings(w)
+	h := append([]string(nil), haves...)
+	sort.Strings(h)
+	s := append([]string(nil), shallow...)
+	sort.Strings(s)
+	return strings.Join(w, "|") + "\ndepth=" + itoa(depth) + "\nhaves=" + strings.Join(h, "|") + "\nshallow=" + strings.Join(s, "|")
+}
+
+func getPackCache(r *Repo, key string) *packEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.packCache == nil {
+		return nil
+	}
+	return r.packCache[key]
+}
+
+func setPackCache(r *Repo, key string, ent *packEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.packCache == nil {
+		r.packCache = make(map[string]*packEntry)
+	}
+	if len(r.packCache) > 32 {
+		r.packCache = make(map[string]*packEntry)
+	}
+	r.packCache[key] = ent
 }
 
 func ptrInt(v int) *int {

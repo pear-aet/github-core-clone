@@ -498,6 +498,9 @@ func gqlCloseIssue(s *Store, q string, vars map[string]interface{}) map[string]i
 		for _, iss := range repo.Issues {
 			if "I_"+itoa(iss.ID) == issueID {
 				iss.State = "closed"
+				repo.mu.Lock()
+				iss.cachedJSON = nil
+				repo.mu.Unlock()
 				return map[string]interface{}{"data": map[string]interface{}{"closeIssue": map[string]interface{}{"issue": gqlIssue(iss)}}}
 			}
 		}
